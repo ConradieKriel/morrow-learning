@@ -1,0 +1,42 @@
+# Dependencies and build output
+node_modules/
+.next/
+out/
+build/
+coverage/
+.vercel/
+
+# Local environment files and secrets. Keep only the placeholder template.
+.env*
+!.env.example
+.env.local
+.env.*.local
+
+# Private keys, credentials and local tooling state
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets/
+.DS_Store
+*.log
+supabase/.temp/
+
+# Local package-manager credentials/config
+.npmrc
+
+# Local database exports and private backups
+*.sql.gz
+*.dump
+*.bak
+*.backup
+*.sqlite
+*.db
+
+# Debug/build tooling caches and logs
+.turbo/
+.cache/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
