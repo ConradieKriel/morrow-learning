@@ -10,7 +10,7 @@ import { buildManualActivityHtml, createManualQuestion, type ManualQuestionInput
 import { ACTIVITY_LANGUAGES, DEFAULT_ACTIVITY_LANGUAGE, normalizeActivityLanguage, type ActivityLanguage } from '@/lib/activity-languages';
 
 type AppScreen = 'dashboard' | 'builder';
-type Config = { supabaseConfigured: boolean; fakeMode: boolean; geminiConfigured: boolean; groqConfigured: boolean; model: string; groqModel: string };
+type Config = { supabaseConfigured: boolean; fakeMode: boolean; geminiConfigured: boolean; groqConfigured: boolean; model: string; groqModel: string; primaryProvider?: string };
 
 async function readStream(response: Response, onText: (value: string) => void): Promise<string> {
   if (!response.body) throw new Error('The generation service returned an empty response.');
@@ -564,7 +564,7 @@ export default function MorrowHome() {
               <div><p className="eyebrow">TEACHER WORKSPACE</p><h1>Your activities.</h1><p className="muted">Describe what you want learners to do. Morrow builds a complete interactive activity you can preview, refine and share.</p></div>
               <div className="form-actions"><button className="button primary-button" onClick={startNewActivity}>＋ Create activity</button></div>
             </section>
-            <div className="mode-row"><span className={config.fakeMode ? 'mode-dot sample-mode' : 'mode-dot live-mode'} />{config.fakeMode ? 'Sample mode is on. You can also build activities manually without AI.' : config.geminiConfigured && config.groqConfigured ? `Gemini is connected (${config.model}) with Groq as an automatic backup (${config.groqModel}).` : config.geminiConfigured ? `Gemini is connected (${config.model}).` : config.groqConfigured ? `Groq AI is connected (${config.groqModel}).` : 'AI generation is unavailable. You can still create activities without AI.'}</div>
+            <div className="mode-row"><span className={config.fakeMode ? 'mode-dot sample-mode' : 'mode-dot live-mode'} />{config.fakeMode ? 'Sample mode is on. You can also build activities manually without AI.' : config.geminiConfigured && config.groqConfigured ? `Groq is the primary AI (${config.groqModel}) with Gemini as an automatic backup (${config.model}).` : config.geminiConfigured ? `Gemini is connected (${config.model}).` : config.groqConfigured ? `Groq AI is connected (${config.groqModel}).` : 'AI generation is unavailable. You can still create activities without AI.'}</div>
             {notice && <p className="notice">{notice}</p>}
             <section className="section-block">
               <div className="section-heading"><div><h2>My saved activities</h2><p>{activities.length} {activities.length === 1 ? 'activity' : 'activities'} saved to your account</p></div></div>

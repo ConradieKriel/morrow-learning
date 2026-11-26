@@ -1,15 +1,17 @@
 import { getRequestContext, jsonError } from '@/lib/supabase-server';
 import { SAMPLE_ACTIVITY_HTML } from '@/lib/sample-activity';
+import { validateGeneratedHtml } from '@/lib/html-sandbox';
 import { normalizeActivityLanguage } from '@/lib/activity-languages';
 import { consumeRateLimit, isSameOriginMutation, privateJson, readJsonBody } from '@/lib/api-security';
 
 export const runtime = 'nodejs';
-// Allow enough time for a complete free-form HTML activity to be generated.
-// Vercel Hobby supports up to 300 seconds when Fluid Compute is enabled.
-export const maxDuration = 300;
+// Keep a margin below Vercel's 300-second Hobby function ceiling.
+// Providers are tried one at a time, with a bounded total time and idle-stream timeout.
+export const maxDuration = 260;
 
-const GEMINI_TIMEOUT_MS = 275_000;
-const GROQ_TIMEOUT_MS = 275_000;
+const PROVIDER_TIMEOUT_MS = 105_000;
+const PROVIDER_HEADER_TIMEOUT_MS = 20_000;
+const PROVIDER_IDLE_TIMEOUT_MS = 45_000;
 
 class ProviderHttpError extends Error {
   constructor(public provider: string, public status: number, message: string) {
@@ -19,7 +21,112 @@ class ProviderHttpError extends Error {
 }
 
 function canFallbackFromProvider(error: unknown): error is ProviderHttpError {
-  return error instanceof ProviderHttpError && [408, 429, 500, 502, 503, 504].includes(error.status);
+  return error instanceof ProviderHttpError && [400, 401, 403, 404, 408, 409, 413, 422, 429, 500, 502, 503, 504].includes(error.status);
+}
+
+type SseParser = (payload: string) => string;
+
+async function readSseText(
+  body: ReadableStream<Uint8Array>,
+  provider: string,
+  signal: AbortSignal,
+  parsePayload: SseParser,
+): Promise<string> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let output = '';
+
+  const consumeLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) return;
+    const payload = trimmed.slice(5).trim();
+    if (!payload || payload === '[DONE]') return;
+    try {
+      output += parsePayload(payload);
+    } catch (error) {
+      if (error instanceof ProviderHttpError) throw error;
+      throw new ProviderHttpError(provider, 502, `${provider} returned an unreadable streaming response.`);
+    }
+  };
+
+  try {
+    while (true) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let abortHandler: (() => void) | undefined;
+      let result: ReadableStreamReadResult<Uint8Array>;
+      try {
+        result = await Promise.race([
+          reader.read(),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new ProviderHttpError(provider, 504, `${provider} stopped sending output for ${PROVIDER_IDLE_TIMEOUT_MS / 1000} seconds.`)), PROVIDER_IDLE_TIMEOUT_MS);
+            abortHandler = () => reject(new ProviderHttpError(provider, 504, `${provider} exceeded its ${PROVIDER_TIMEOUT_MS / 1000}-second generation limit.`));
+            signal.addEventListener('abort', abortHandler, { once: true });
+            if (signal.aborted) abortHandler();
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+        if (abortHandler) signal.removeEventListener('abort', abortHandler);
+      }
+
+      if (result.done) {
+        buffer += decoder.decode();
+        if (buffer) consumeLine(buffer);
+        break;
+      }
+
+      buffer += decoder.decode(result.value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) consumeLine(line);
+      if (signal.aborted) {
+        throw new ProviderHttpError(provider, 504, `${provider} exceeded its ${PROVIDER_TIMEOUT_MS / 1000}-second generation limit.`);
+      }
+    }
+  } catch (error) {
+    try { await reader.cancel(error); } catch { /* The upstream may already be closed. */ }
+    if (signal.aborted && !(error instanceof ProviderHttpError)) {
+      throw new ProviderHttpError(provider, 504, `${provider} exceeded its ${PROVIDER_TIMEOUT_MS / 1000}-second generation limit.`);
+    }
+    if (error instanceof ProviderHttpError) throw error;
+    throw new ProviderHttpError(provider, 503, `${provider} stopped while generating the activity: ${error instanceof Error ? error.message : 'stream error'}`);
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (!output.trim()) throw new ProviderHttpError(provider, 502, `${provider} finished without returning any activity content.`);
+  return output;
+}
+
+async function fetchProviderResponse(
+  url: string,
+  init: RequestInit,
+  provider: string,
+  requestSignal: AbortSignal,
+): Promise<{ response: Response; signal: AbortSignal }> {
+  const totalTimeout = AbortSignal.timeout(PROVIDER_TIMEOUT_MS);
+  const headerTimeout = new AbortController();
+  const signal = AbortSignal.any([requestSignal, totalTimeout]);
+  const fetchSignal = AbortSignal.any([signal, headerTimeout.signal]);
+  const timer = setTimeout(() => headerTimeout.abort(), PROVIDER_HEADER_TIMEOUT_MS);
+  let response: Response;
+  try {
+    response = await fetch(url, { ...init, signal: fetchSignal });
+  } catch (error) {
+    if (requestSignal.aborted) throw new Error('The generation request was cancelled because the page was closed or refreshed.');
+    if (headerTimeout.signal.aborted) throw new ProviderHttpError(provider, 504, `${provider} did not start responding within ${PROVIDER_HEADER_TIMEOUT_MS / 1000} seconds.`);
+    if (totalTimeout.aborted) throw new ProviderHttpError(provider, 504, `${provider} exceeded its ${PROVIDER_TIMEOUT_MS / 1000}-second generation limit.`);
+    throw new ProviderHttpError(provider, 503, `${provider} could not be reached: ${error instanceof Error ? error.message : 'network error'}`);
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!response.ok || !response.body) {
+    const detail = await response.text().catch(() => '');
+    throw new ProviderHttpError(provider, response.status || 502, `${provider} request failed (${response.status}). ${detail.slice(0, 700)}`);
+  }
+  return { response, signal };
 }
 
 const SYSTEM_PROMPT = `You are the activity creator inside Morrow, a small classroom learning tool. Return exactly one complete, standalone HTML document and nothing else. The document must contain its own HTML, CSS and JavaScript. Do not use Markdown fences. Create the kind of activity the teacher describes: it can be a game, simulation, interactive diagram, branching story, drag-and-drop activity, practice exercise, virtual lab, puzzle, or other useful learning experience. Do not default to a multiple-choice quiz unless the teacher asks for one.
@@ -53,7 +160,6 @@ async function streamGemini(prompt: string, currentHtml: string, action: string,
   const gradeInstruction = targetGrade === 'Any grade'
     ? `TARGET LEARNER LEVEL: Any grade. The teacher has not selected a specific grade. Make the activity broadly accessible, explain subject-specific vocabulary, avoid assuming advanced prior knowledge, and offer a gentle progression from introductory to more challenging parts where useful. Do not label the activity as Grade 7 or assume a particular age.`
     : `TARGET LEARNER LEVEL: ${targetGrade} in the South African school system. This grade selection is authoritative and must shape the actual content, not merely appear in the title. Adjust vocabulary, sentence length, reading load, abstraction, prerequisite knowledge, examples, number complexity, scaffolding, instructions and expected independence to be appropriate for ${targetGrade}. Keep concepts and tasks suitable for learners at this grade. Do not silently change the target grade. If the teacher asks for a more challenging or easier activity, adjust difficulty within ${targetGrade} rather than switching to a different grade. Review every question, answer option, explanation and interaction against this level.`;
-
   const taskPrompt = action === 'fix'
     ? `Fix the runtime error in this activity. Return the entire corrected HTML page, not a patch. Keep all learner-facing content in the required language. Error: ${errorText}\n\nCurrent HTML:\n${currentHtml}`
     : action === 'refine'
@@ -61,90 +167,30 @@ async function streamGemini(prompt: string, currentHtml: string, action: string,
       : `Create a new interactive learning activity from this teacher request. Follow the teacher's requested activity type and requirements rather than copying a sample or default activity.\n\nTeacher request: ${prompt}`;
   const fullPrompt = `${languageInstruction}\n\n${gradeInstruction}\n\n${taskPrompt}`;
 
-  const timeoutSignal = AbortSignal.timeout(GEMINI_TIMEOUT_MS);
-  const combinedSignal = AbortSignal.any([requestSignal, timeoutSignal]);
-  let response: Response;
-  try {
-    response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, {
+  const { response, signal } = await fetchProviderResponse(
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`,
+    {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: `${SYSTEM_PROMPT}\n\n${languageInstruction}\n\n${gradeInstruction}` }] },
         contents: [{ role: 'user', parts: [{ text: fullPrompt }] }],
-        // Low thinking is quicker for routine lesson/activity creation. Teachers can
-        // still ask for detailed, challenging activities in their prompt.
         generationConfig: { maxOutputTokens: 12000, thinkingConfig: { thinkingLevel: 'low' } },
       }),
-      signal: combinedSignal,
-    });
-  } catch (error) {
-    if (timeoutSignal.aborted) {
-      throw new ProviderHttpError('Gemini', 504, 'Gemini took too long to start generating.');
-    }
-    if (requestSignal.aborted) {
-      throw new Error('The generation request was cancelled because the page was closed or refreshed.');
-    }
-    if (error instanceof Error) throw new ProviderHttpError('Gemini', 503, `Gemini could not be reached: ${error.message}`);
-    throw new ProviderHttpError('Gemini', 503, 'Gemini could not be reached.');
-  }
-
-  if (!response.ok || !response.body) {
-    const detail = await response.text().catch(() => '');
-    throw new ProviderHttpError('Gemini', response.status, `Gemini request failed (${response.status}). ${detail.slice(0, 700)}`);
-  }
-
-  const encoder = new TextEncoder();
-  const upstream = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  return new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      try {
-        while (true) {
-          const { value, done } = await upstream.read();
-          if (done) {
-            buffer += decoder.decode();
-            const finalLines = buffer.split('\n');
-            for (const line of finalLines) {
-              if (!line.startsWith('data:')) continue;
-              const raw = line.slice(5).trim();
-              if (!raw || raw === '[DONE]') continue;
-              const parsed = JSON.parse(raw) as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>; error?: { message?: string } };
-              const piece = parsed.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join('') || '';
-              if (piece) controller.enqueue(encoder.encode(piece));
-            }
-            controller.close();
-            return;
-          }
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-          for (const line of lines) {
-            if (!line.startsWith('data:')) continue;
-            const raw = line.slice(5).trim();
-            if (!raw || raw === '[DONE]') continue;
-            const parsed = JSON.parse(raw) as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>; error?: { message?: string } };
-            const piece = parsed.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join('') || '';
-            if (piece) controller.enqueue(encoder.encode(piece));
-          }
-          return;
-        }
-      } catch (error) {
-        controller.error(error);
-      }
     },
-    async cancel() {
-      if (!combinedSignal.aborted) {
-        // Stop the provider request if the browser leaves the page.
-        try { await upstream.cancel(); } catch { /* The upstream may already be closed. */ }
-      }
-    },
+    'Gemini',
+    requestSignal,
+  );
+
+  const html = await readSseText(response.body!, 'Gemini', signal, (payload) => {
+    const parsed = JSON.parse(payload) as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>; error?: { code?: number; message?: string } };
+    if (parsed.error) throw new ProviderHttpError('Gemini', parsed.error.code || 502, parsed.error.message || 'Gemini returned an error in its stream.');
+    return parsed.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join('') || '';
   });
+  try { return textStream(validateGeneratedHtml(html)); }
+  catch (error) { throw new ProviderHttpError('Gemini', 502, error instanceof Error ? error.message : 'Gemini returned an incomplete activity.'); }
 }
 
-
-// Groq uses an OpenAI-compatible streaming endpoint. It is a secondary provider:
-// Gemini remains primary when both keys are configured.
 async function streamGroq(prompt: string, currentHtml: string, action: string, errorText: string, history: RefinementMessage[], targetLanguage: string, targetGrade: string, requestSignal: AbortSignal) {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) throw new Error('Groq is not configured. Add GROQ_API_KEY to your environment variables.');
@@ -158,11 +204,9 @@ async function streamGroq(prompt: string, currentHtml: string, action: string, e
     : action === 'refine'
       ? `Improve the current activity as requested. Return the entire updated HTML document and keep working features.\n\nEarlier refinement conversation:\n${history.map((item) => `${item.role === 'teacher' ? 'Teacher' : 'Morrow'}: ${item.text}`).join('\n')}\n\nLatest teacher request: ${prompt}\n\nCurrent HTML:\n${currentHtml}`
       : `Create a new interactive learning activity from this teacher request. Follow the teacher's requested activity type rather than defaulting to multiple choice.\n\nTeacher request: ${prompt}`;
-  const timeoutSignal = AbortSignal.timeout(GROQ_TIMEOUT_MS);
-  const combinedSignal = AbortSignal.any([requestSignal, timeoutSignal]);
-  let response: Response;
-  try {
-    response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+  const { response, signal } = await fetchProviderResponse(
+    'https://api.groq.com/openai/v1/chat/completions',
+    {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({
@@ -175,64 +219,18 @@ async function streamGroq(prompt: string, currentHtml: string, action: string, e
         max_completion_tokens: 12000,
         reasoning_effort: 'low',
       }),
-      signal: combinedSignal,
-    });
-  } catch (error) {
-    if (timeoutSignal.aborted) throw new ProviderHttpError('Groq', 504, 'Groq took too long to start generating.');
-    if (requestSignal.aborted) throw new Error('The generation request was cancelled because the page was closed or refreshed.');
-    throw new ProviderHttpError('Groq', 503, `Groq could not be reached: ${error instanceof Error ? error.message : 'network error'}`);
-  }
-
-  if (!response.ok || !response.body) {
-    const detail = await response.text().catch(() => '');
-    throw new ProviderHttpError('Groq', response.status, `Groq request failed (${response.status}). ${detail.slice(0, 700)}`);
-  }
-
-  const encoder = new TextEncoder();
-  const upstream = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  return new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      try {
-        while (true) {
-          const { value, done } = await upstream.read();
-          if (done) {
-            buffer += decoder.decode();
-            for (const line of buffer.split('\n')) {
-              if (!line.startsWith('data:')) continue;
-              const raw = line.slice(5).trim();
-              if (!raw || raw === '[DONE]') continue;
-              const parsed = JSON.parse(raw) as { choices?: Array<{ delta?: { content?: string | null } }> };
-              const piece = parsed.choices?.[0]?.delta?.content || '';
-              if (piece) controller.enqueue(encoder.encode(piece));
-            }
-            controller.close();
-            return;
-          }
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-          for (const line of lines) {
-            if (!line.startsWith('data:')) continue;
-            const raw = line.slice(5).trim();
-            if (!raw || raw === '[DONE]') continue;
-            const parsed = JSON.parse(raw) as { choices?: Array<{ delta?: { content?: string | null } }> };
-            const piece = parsed.choices?.[0]?.delta?.content || '';
-            if (piece) controller.enqueue(encoder.encode(piece));
-          }
-          return;
-        }
-      } catch (error) {
-        controller.error(error);
-      }
     },
-    async cancel() {
-      if (!combinedSignal.aborted) {
-        try { await upstream.cancel(); } catch { /* The upstream may already be closed. */ }
-      }
-    },
+    'Groq',
+    requestSignal,
+  );
+
+  const html = await readSseText(response.body!, 'Groq', signal, (payload) => {
+    const parsed = JSON.parse(payload) as { choices?: Array<{ delta?: { content?: string | null } }>; error?: { message?: string } };
+    if (parsed.error) throw new ProviderHttpError('Groq', 502, parsed.error.message || 'Groq returned an error in its stream.');
+    return parsed.choices?.[0]?.delta?.content || '';
   });
+  try { return textStream(validateGeneratedHtml(html)); }
+  catch (error) { throw new ProviderHttpError('Groq', 502, error instanceof Error ? error.message : 'Groq returned an incomplete activity.'); }
 }
 
 export async function POST(request: Request) {
@@ -284,19 +282,27 @@ export async function POST(request: Request) {
     if (!hasGemini && !hasGroq) return jsonError('No live AI provider is configured. Add GEMINI_API_KEY or GROQ_API_KEY in Vercel.', 503);
 
     let stream: ReadableStream<Uint8Array>;
-    let provider: 'gemini' | 'groq' | 'groq-backup';
-    if (hasGemini) {
+    let provider: 'groq' | 'gemini' | 'gemini-backup';
+    // Prefer Groq when configured because it is intended to return activities quickly.
+    // Gemini remains the automatic backup if Groq rejects, stalls, or returns no usable output.
+    if (hasGroq) {
       try {
-        stream = await streamGemini(prompt, currentHtml, action, runtimeError, history, targetLanguage, targetGrade, request.signal);
-        provider = 'gemini';
-      } catch (primaryError) {
-        if (!hasGroq || !canFallbackFromProvider(primaryError) || request.signal.aborted) throw primaryError;
         stream = await streamGroq(prompt, currentHtml, action, runtimeError, history, targetLanguage, targetGrade, request.signal);
-        provider = 'groq-backup';
+        provider = 'groq';
+      } catch (primaryError) {
+        if (!hasGemini || !canFallbackFromProvider(primaryError) || request.signal.aborted) throw primaryError;
+        try {
+          stream = await streamGemini(prompt, currentHtml, action, runtimeError, history, targetLanguage, targetGrade, request.signal);
+          provider = 'gemini-backup';
+        } catch (backupError) {
+          const firstMessage = primaryError instanceof Error ? primaryError.message : 'Groq failed.';
+          const backupMessage = backupError instanceof Error ? backupError.message : 'Gemini failed.';
+          throw new ProviderHttpError('AI providers', 502, `Groq could not finish the activity (${firstMessage}). Gemini backup also failed (${backupMessage}).`);
+        }
       }
     } else {
-      stream = await streamGroq(prompt, currentHtml, action, runtimeError, history, targetLanguage, targetGrade, request.signal);
-      provider = 'groq';
+      stream = await streamGemini(prompt, currentHtml, action, runtimeError, history, targetLanguage, targetGrade, request.signal);
+      provider = 'gemini';
     }
     return new Response(stream, {
       headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'private, no-store, max-age=0', 'X-Morrow-Mode': provider, 'Vary': 'Authorization' },

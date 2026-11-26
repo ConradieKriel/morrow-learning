@@ -8,5 +8,6 @@ export async function GET() {
     groqConfigured: Boolean(process.env.GROQ_API_KEY),
     model: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
     groqModel: process.env.GROQ_MODEL || 'openai/gpt-oss-120b',
+    primaryProvider: process.env.GROQ_API_KEY ? 'groq' : 'gemini',
   });
 }

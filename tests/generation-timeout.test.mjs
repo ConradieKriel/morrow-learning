@@ -4,17 +4,20 @@ import { readFile } from 'node:fs/promises';
 
 const route = await readFile(new URL('../app/api/generate/route.ts', import.meta.url), 'utf8');
 
-test('Gemini generation has a five-minute server allowance', () => {
-  assert.match(route, /export const maxDuration = 300;/);
-  assert.match(route, /const GEMINI_TIMEOUT_MS = 275_000;/);
+test('AI provider timeouts leave margin below Vercel function limit', () => {
+  assert.match(route, /export const maxDuration = 260;/);
+  assert.match(route, /const PROVIDER_TIMEOUT_MS = 105_000;/);
+  assert.match(route, /const PROVIDER_HEADER_TIMEOUT_MS = 20_000;/);
+  assert.match(route, /const PROVIDER_IDLE_TIMEOUT_MS = 45_000;/);
 });
 
-test('Gemini uses low thinking effort for routine classroom activity generation', () => {
-  assert.match(route, /thinkingConfig:\s*\{\s*thinkingLevel:\s*'low'\s*\}/);
-  assert.doesNotMatch(route, /temperature:\s*0\.65/);
+test('stream stalls and empty output are treated as provider failures and can trigger fallback', () => {
+  assert.match(route, /stopped sending output for/);
+  assert.match(route, /finished without returning any activity content/);
+  assert.match(route, /canFallbackFromProvider\(primaryError\)/);
 });
 
-test('Gemini requests are cancelled if the browser request is cancelled', () => {
-  assert.match(route, /AbortSignal\.any\(\[requestSignal, timeoutSignal\]\)/);
-  assert.match(route, /request\.signal\)/);
+test('provider requests are cancelled when the browser cancels generation', () => {
+  assert.match(route, /AbortSignal\.any\(\[requestSignal, totalTimeout\]\)/);
+  assert.match(route, /requestSignal\.aborted/);
 });

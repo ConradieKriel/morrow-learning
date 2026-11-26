@@ -10,7 +10,7 @@ The visual design keeps the original Morrow name, green palette, simple cards an
 - Learners do not have accounts. Teachers share a short link that opens the activity directly.
 - Teacher dashboard and saved activity list.
 - Free-form generation from a description or pasted lesson notes.
-- Live AI APIs called only from the server, with Groq as an optional automatic backup when Gemini is busy or unavailable. Both providers stream their output.
+- Live AI APIs are called only from the server. When both keys are configured, Groq is tried first and Gemini is the automatic backup. Provider output is checked fully before Morrow sends it to the browser, so stalled or incomplete generation can safely fail over.
 - Sample/fake mode (`MORROW_FAKE_MODE=true`) for interface testing without using a live AI provider.
 - Phone-friendly sandboxed HTML preview using `sandbox="allow-scripts"` and no `allow-same-origin`.
 - Runtime error capture in the teacher preview and at most two AI-provider auto-fix attempts when live mode is enabled.
@@ -49,9 +49,7 @@ npm run dev
 3. Set `MORROW_FAKE_MODE=false`.
 4. Restart the development server.
 
-For Groq, the default model is `openai/gpt-oss-120b`; override it with `GROQ_MODEL` if required. Keep both keys server-only and never prefix them with `NEXT_PUBLIC_`.
-
-The default model is `gemini-3.8-flash`. You can optionally add a Groq API key as a backup. Gemini is tried first; if the provider rejects the request as busy or unavailable (HTTP 408, 429 or 5xx) before streaming begins, Morrow retries with Groq. If you configure Groq alone, it is used as the primary provider. The keys are used only by `app/api/generate/route.ts` and are never sent to the browser.
+For Groq, the default model is `openai/gpt-oss-120b`; override it with `GROQ_MODEL` if required. When `GROQ_API_KEY` is configured, Groq is the primary provider and Gemini is the automatic backup. If only Gemini is configured, Morrow uses Gemini. Provider streams are read and validated server-side before being returned to the browser; a provider that does not start within 20 seconds, becomes idle for 45 seconds, or exceeds 105 seconds total is treated as failed. The route allows up to 260 seconds for one provider plus a backup attempt. Keep both keys server-only and never prefix them with `NEXT_PUBLIC_`. The keys are used only by `app/api/generate/route.ts` and are never sent to the browser.
 
 ## Important routes
 
@@ -59,7 +57,7 @@ The default model is `gemini-3.8-flash`. You can optionally add a Groq API key a
 |---|---|
 | `/` | Teacher sign-in, account creation and workspace |
 | `/a/<short-id>` | Public, phone-friendly learner activity |
-| `POST /api/generate` | Sample mode or streamed Gemini/Groq generation, refinement and repair |
+| `POST /api/generate` | Sample mode or buffered Gemini/Groq generation with progressive delivery to the browser, refinement and repair |
 | `/api/activities` | List and save the signed-in teacher's activities |
 | `/api/activities/<id>/versions` | Read version history |
 | `/api/activities/<id>/restore` | Restore a prior version as a new version |

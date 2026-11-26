@@ -35,9 +35,11 @@ Keep Production and Preview environment variables separate. Ideally create a sec
 New share URLs are short, for example `/a/Ab12Cd3Ef9012XyZ` (16 random characters). Existing 9-character links remain compatible. Teachers can revoke a link from the activity editor; the old URL then stops working. It uses the actual deployed domain, not a long encoded activity payload. If the domain changes, previously shared links work on the old domain only unless you keep a custom domain attached.
 
 
-## Long AI generations
+## AI generation timeouts and providers
 
-Morrow's `/api/generate` route allows up to 300 seconds for free-form activity creation, with a 275-second upstream timeout for either AI provider. On Vercel, use Node.js runtime with Fluid Compute enabled. Vercel Hobby supports up to 300 seconds with Fluid Compute; projects without Fluid Compute have lower function-duration limits. If a generation still times out, check the function logs and the Gemini API response before increasing limits further.
+When `GROQ_API_KEY` is configured, Morrow tries Groq first and Gemini second. This avoids waiting on Gemini when it is busy. The full provider stream is checked server-side before sending it to the browser, so an incomplete or stalled Groq response can safely fall back to Gemini. Each provider is limited to 105 seconds total, 20 seconds to return response headers, and 45 seconds without streamed output. The route maximum is 260 seconds, leaving a margin below the 300-second Vercel Hobby limit. If neither provider completes, the route returns an error and the manual builder remains available.
+
+Keep both API keys server-only. Set `GROQ_MODEL` to `openai/gpt-oss-120b` unless you intentionally choose another model supported by your Groq account. Set `GEMINI_MODEL` to a currently supported Gemini model.
 
 
 ## Git-based deployments
