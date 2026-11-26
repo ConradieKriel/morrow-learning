@@ -18,12 +18,12 @@ git check-ignore -v .env.local
 
 It should print a matching `.gitignore` rule. If it prints nothing, stop and fix `.gitignore` before staging files.
 
-## 2. Create a private GitHub repository
+## 2. Create a GitHub repository
 
 1. Sign in at [GitHub](https://github.com/).
 2. Click **New repository**.
 3. Name it `morrow-learning`.
-4. Set visibility to **Private** while this is coursework and before you have reviewed every file for secrets.
+4. Choose **Public** or **Private** based on who needs access. Public is fine when the repository contains no secrets or private data; keep API keys and `.env.local` out of GitHub.
 5. Do not initialise it with a README, `.gitignore` or licence because those files already exist in this project.
 6. Create the repository and leave its page open.
 
@@ -72,7 +72,7 @@ GitHub may open a browser window to authenticate. Do not put a password or perso
 
 On GitHub, open **Settings**:
 
-1. Keep the repository private unless your group has a reason to make it public.
+1. Keep visibility aligned with your collaboration needs. A public repository can be used for external review, provided no secrets or private data are committed.
 2. Under **Code security and analysis**, enable secret scanning and push protection if your plan offers them.
 3. Under **Branches**, add a rule for `main`. Require pull requests and require the **Morrow checks** workflow to pass before merging. Disallow force pushes.
 4. Keep the `.github/dependabot.yml` file. It asks GitHub to offer dependency and GitHub Actions updates each week.

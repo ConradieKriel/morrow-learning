@@ -3,8 +3,8 @@
 ## Before deployment
 
 - Complete `SUPABASE-SETUP.md` and confirm the app works locally.
-- Create a Gemini API key at [Google AI Studio](https://aistudio.google.com/app/apikey).
-- Push the project folder to a private GitHub repository using [`GITHUB-SETUP.md`](GITHUB-SETUP.md). Do not commit `.env.local` or any API key.
+- Create a Gemini API key at [Google AI Studio](https://aistudio.google.com/app/apikey). Optionally create a Groq key at [Groq Console](https://console.groq.com/keys) for automatic backup.
+- Push the project folder to your GitHub repository using [`GITHUB-SETUP.md`](GITHUB-SETUP.md). Do not commit `.env.local` or any API key.
 - Run `supabase/migrations/20261112_security_hardening.sql` in Supabase if this is an existing database.
 
 ## Import the repository
@@ -20,7 +20,9 @@
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Your Supabase public anon/publishable key |
 | `GEMINI_API_KEY` | Your Google AI Studio API key |
 | `GEMINI_MODEL` | `gemini-3.8-flash` |
-| `MORROW_FAKE_MODE` | `true` for sample mode, `false` for live Gemini generation |
+| `MORROW_FAKE_MODE` | `true` for sample mode, `false` for live AI generation |
+| `GROQ_API_KEY` | Optional server-only Groq backup key |
+| `GROQ_MODEL` | Optional Groq model override; defaults to `openai/gpt-oss-120b` |
 | `APP_URL` | Your final public URL, e.g. `https://morrow-learning.vercel.app` (server-side only) |
 
 5. Deploy. When the first deploy is ready, set `APP_URL` to the assigned production URL and redeploy if needed.
@@ -28,14 +30,14 @@
 
 ## Preview and production
 
-Keep Production and Preview environment variables separate. Ideally create a second Supabase project for Preview; do not point untrusted preview deployments or pull-request builds at your production database. Add the Gemini key only to the environments that genuinely need live generation. Keep fake mode enabled for interface work. Set `MORROW_FAKE_MODE=false` only when the Gemini API key is configured and you are ready to test paid/limited API calls.
+Keep Production and Preview environment variables separate. Ideally create a second Supabase project for Preview; do not point untrusted preview deployments or pull-request builds at your production database. Add the Gemini key and, optionally, the Groq backup key only to the environments that genuinely need live generation. Keep keys server-only with no `NEXT_PUBLIC_` prefix. Keep fake mode enabled for interface work. Set `MORROW_FAKE_MODE=false` only when at least one live AI key is configured.
 
 New share URLs are short, for example `/a/Ab12Cd3Ef9012XyZ` (16 random characters). Existing 9-character links remain compatible. Teachers can revoke a link from the activity editor; the old URL then stops working. It uses the actual deployed domain, not a long encoded activity payload. If the domain changes, previously shared links work on the old domain only unless you keep a custom domain attached.
 
 
 ## Long AI generations
 
-Morrow's `/api/generate` route allows up to 300 seconds for free-form activity creation, with a 275-second upstream Gemini timeout. On Vercel, use Node.js runtime with Fluid Compute enabled. Vercel Hobby supports up to 300 seconds with Fluid Compute; projects without Fluid Compute have lower function-duration limits. If a generation still times out, check the function logs and the Gemini API response before increasing limits further.
+Morrow's `/api/generate` route allows up to 300 seconds for free-form activity creation, with a 275-second upstream timeout for either AI provider. On Vercel, use Node.js runtime with Fluid Compute enabled. Vercel Hobby supports up to 300 seconds with Fluid Compute; projects without Fluid Compute have lower function-duration limits. If a generation still times out, check the function logs and the Gemini API response before increasing limits further.
 
 
 ## Git-based deployments

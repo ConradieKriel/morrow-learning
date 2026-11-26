@@ -37,11 +37,11 @@ export async function getRequestContext(request: Request): Promise<RequestContex
 
   const { data: profile, error: profileError } = await supabase
     .from('profiles')
-    .select('id,email,role,grade,display_name')
+    .select('id,email,role,display_name')
     .eq('id', authData.user.id)
     .single();
 
-  if (profileError || !profile || (profile.role !== 'teacher' && profile.role !== 'student')) return null;
+  if (profileError || !profile || profile.role !== 'teacher') return null;
   return { supabase, user: authData.user, profile: profile as Profile };
 }
 

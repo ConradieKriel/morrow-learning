@@ -5,9 +5,8 @@ import PublicActivity from '@/components/public-activity';
 export const dynamic = 'force-dynamic';
 export const metadata = { title: 'Morrow Learning', description: 'A learning activity made with Morrow.' };
 
-export default async function SharedActivityPage({ params, searchParams }: { params: Promise<{ slug: string }>; searchParams: Promise<{ from?: string }> }) {
-  const [{ slug }, query] = await Promise.all([params, searchParams]);
-  const showStudentHomeLink = query.from === 'student-home';
+export default async function SharedActivityPage({ params }: { params: Promise<{ slug: string }> }) {
+  const { slug } = await params;
   if (!/^(?:[A-Za-z0-9]{9}|[A-Za-z0-9]{16})$/.test(slug)) notFound();
   const supabase = getPublicSupabase(slug);
   if (!supabase) return <main className="center-screen"><section className="login-card"><div className="brand"><span className="brand-icon">m</span><span>morrow</span></div><h1>Morrow is not set up yet.</h1><p className="muted">The site owner needs to add the Supabase project details before shared activities can open.</p></section></main>;
@@ -21,5 +20,5 @@ export default async function SharedActivityPage({ params, searchParams }: { par
     .eq('is_published', true)
     .maybeSingle();
   if (error || !activity) notFound();
-  return <PublicActivity title={activity.title} subject={activity.subject} grade={activity.grade} language={activity.language || 'English'} html={activity.html} showStudentHomeLink={showStudentHomeLink} />;
+  return <PublicActivity title={activity.title} subject={activity.subject} grade={activity.grade} language={activity.language || 'English'} html={activity.html} />;
 }

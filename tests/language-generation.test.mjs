@@ -31,7 +31,7 @@ test('Gemini receives the selected language as a system instruction for all lear
 
 test('non-English generation is not silently replaced by the English sample in fake mode', () => {
   assert.match(route, /targetLanguage !== 'English'/);
-  assert.match(route, /Language-specific generation needs live Gemini/);
+  assert.match(route, /Language-specific generation needs live AI/);
 });
 
 test('selected language is saved and restored with activities and versions', () => {

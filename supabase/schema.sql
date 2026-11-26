@@ -6,11 +6,40 @@ create extension if not exists pgcrypto;
 create table if not exists public.profiles (
   id uuid primary key references auth.users(id) on delete cascade,
   email text not null unique,
-  role text not null check (role in ('teacher', 'student')),
+  role text not null default 'teacher' check (role = 'teacher'),
   grade text,
   display_name text,
   created_at timestamptz not null default now()
 );
+
+-- Every new Supabase Auth account is given a teacher profile automatically.
+-- The role is fixed here so a browser cannot register as another account type.
+create or replace function public.handle_new_teacher_profile()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $function$
+begin
+  insert into public.profiles (id, email, role, grade, display_name)
+  values (
+    new.id,
+    coalesce(new.email, new.id::text || '@unknown.invalid'),
+    'teacher',
+    null,
+    coalesce(nullif(btrim(new.raw_user_meta_data ->> 'display_name'), ''), nullif(split_part(coalesce(new.email, ''), '@', 1), ''), 'Teacher')
+  )
+  on conflict (id) do update
+    set email = excluded.email, role = 'teacher', grade = null;
+  return new;
+end;
+$function$;
+
+revoke all on function public.handle_new_teacher_profile() from public, anon, authenticated;
+drop trigger if exists on_auth_user_created_teacher_profile on auth.users;
+create trigger on_auth_user_created_teacher_profile
+after insert on auth.users
+for each row execute function public.handle_new_teacher_profile();
 
 create table if not exists public.activities (
   id uuid primary key default gen_random_uuid(),
@@ -126,17 +155,7 @@ grant select on public.activities to authenticated;
 grant insert, update, delete on public.activities to authenticated;
 grant select, insert on public.activity_versions to authenticated;
 
--- After creating the two Auth users in the Supabase dashboard, run this block.
--- The student demo account is Grade 7 so it can see Grade 7 published activities.
-insert into public.profiles (id, email, role, grade, display_name)
-select id, email, 'teacher', null, 'Demo Teacher'
-from auth.users where lower(email) = 'teacher@morrow.app'
-on conflict (id) do update set role = excluded.role, email = excluded.email, grade = excluded.grade, display_name = excluded.display_name;
-
-insert into public.profiles (id, email, role, grade, display_name)
-select id, email, 'student', 'Grade 7', 'Demo Student'
-from auth.users where lower(email) = 'student@morrow.app'
-on conflict (id) do update set role = excluded.role, email = excluded.email, grade = excluded.grade, display_name = excluded.display_name;
+-- New teacher profiles are created by the auth.users trigger above.
 
 -- Security hardening: rebuild policies from a known-good allowlist. PostgreSQL
 -- combines permissive policies with OR, so old permissive policies must be removed.
@@ -197,16 +216,6 @@ on public.activities for select to authenticated
 using (
   teacher_id = (select auth.uid())
   and exists (select 1 from public.profiles p where p.id = (select auth.uid()) and p.role = 'teacher')
-);
-create policy "Students read published activities for their grade"
-on public.activities for select to authenticated
-using (
-  is_published = true and public_slug is not null
-  and exists (
-    select 1 from public.profiles p
-    where p.id = (select auth.uid()) and p.role = 'student'
-      and (public.activities.grade = p.grade or public.activities.grade = 'Any grade')
-  )
 );
 create policy "Public share link reads exact activity"
 on public.activities for select to anon

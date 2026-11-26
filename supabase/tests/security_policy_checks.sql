@@ -1,7 +1,7 @@
 -- Run with `supabase test db` after applying the current schema/migrations.
 -- These pgTAP checks verify the expected grants, policies and function privileges.
 begin;
-select plan(22);
+select plan(24);
 
 select ok(
   (select relrowsecurity from pg_class where oid = 'public.profiles'::regclass),
@@ -33,8 +33,8 @@ select ok(not has_table_privilege('anon', 'public.api_rate_limits', 'SELECT'), '
 
 select is(
   (select count(*)::integer from pg_policies where schemaname = 'public' and tablename = 'activities'),
-  6,
-  'activities has exactly six explicit read/create/update/delete policies'
+  5,
+  'activities has exactly five teacher and public-share policies'
 );
 select is(
   (select count(*)::integer from pg_policies where schemaname = 'public' and tablename = 'profiles'),
@@ -53,8 +53,16 @@ select is(
 );
 
 select ok(
-  exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'activities' and policyname = 'Students read published activities for their grade' and qual ilike '%grade%'),
-  'student activity policy includes a grade restriction'
+  not exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'activities' and policyname ilike '%student%'),
+  'there are no student-only activity policies'
+);
+select ok(
+  exists (select 1 from pg_constraint where conrelid = 'public.profiles'::regclass and conname = 'profiles_role_check' and pg_get_constraintdef(oid) ilike '%teacher%'),
+  'profiles role constraint only allows teachers'
+);
+select ok(
+  exists (select 1 from pg_trigger where tgrelid = 'auth.users'::regclass and tgname = 'on_auth_user_created_teacher_profile' and not tgisinternal),
+  'new Auth accounts receive teacher profiles automatically'
 );
 select ok(
   exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'activities' and policyname = 'Public share link reads exact activity' and qual ilike '%x-morrow-share-slug%'),

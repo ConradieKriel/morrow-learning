@@ -1,10 +1,9 @@
-export type UserRole = 'teacher' | 'student';
+export type UserRole = 'teacher';
 
 export type Profile = {
   id: string;
   email: string;
   role: UserRole;
-  grade: string | null;
   display_name: string | null;
 };
 

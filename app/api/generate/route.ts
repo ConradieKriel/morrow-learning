@@ -9,6 +9,18 @@ export const runtime = 'nodejs';
 export const maxDuration = 300;
 
 const GEMINI_TIMEOUT_MS = 275_000;
+const GROQ_TIMEOUT_MS = 275_000;
+
+class ProviderHttpError extends Error {
+  constructor(public provider: string, public status: number, message: string) {
+    super(message);
+    this.name = 'ProviderHttpError';
+  }
+}
+
+function canFallbackFromProvider(error: unknown): error is ProviderHttpError {
+  return error instanceof ProviderHttpError && [408, 429, 500, 502, 503, 504].includes(error.status);
+}
 
 const SYSTEM_PROMPT = `You are the activity creator inside Morrow, a small classroom learning tool. Return exactly one complete, standalone HTML document and nothing else. The document must contain its own HTML, CSS and JavaScript. Do not use Markdown fences. Create the kind of activity the teacher describes: it can be a game, simulation, interactive diagram, branching story, drag-and-drop activity, practice exercise, virtual lab, puzzle, or other useful learning experience. Do not default to a multiple-choice quiz unless the teacher asks for one.
 
@@ -67,17 +79,18 @@ async function streamGemini(prompt: string, currentHtml: string, action: string,
     });
   } catch (error) {
     if (timeoutSignal.aborted) {
-      throw new Error('Gemini took too long to start generating. Try a shorter or simpler activity request.');
+      throw new ProviderHttpError('Gemini', 504, 'Gemini took too long to start generating.');
     }
     if (requestSignal.aborted) {
       throw new Error('The generation request was cancelled because the page was closed or refreshed.');
     }
-    throw error;
+    if (error instanceof Error) throw new ProviderHttpError('Gemini', 503, `Gemini could not be reached: ${error.message}`);
+    throw new ProviderHttpError('Gemini', 503, 'Gemini could not be reached.');
   }
 
   if (!response.ok || !response.body) {
     const detail = await response.text().catch(() => '');
-    throw new Error(`Gemini request failed (${response.status}). ${detail.slice(0, 700)}`);
+    throw new ProviderHttpError('Gemini', response.status, `Gemini request failed (${response.status}). ${detail.slice(0, 700)}`);
   }
 
   const encoder = new TextEncoder();
@@ -122,7 +135,100 @@ async function streamGemini(prompt: string, currentHtml: string, action: string,
     },
     async cancel() {
       if (!combinedSignal.aborted) {
-        // Stop the Gemini request if the browser leaves the page.
+        // Stop the provider request if the browser leaves the page.
+        try { await upstream.cancel(); } catch { /* The upstream may already be closed. */ }
+      }
+    },
+  });
+}
+
+
+// Groq uses an OpenAI-compatible streaming endpoint. It is a secondary provider:
+// Gemini remains primary when both keys are configured.
+async function streamGroq(prompt: string, currentHtml: string, action: string, errorText: string, history: RefinementMessage[], targetLanguage: string, targetGrade: string, requestSignal: AbortSignal) {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) throw new Error('Groq is not configured. Add GROQ_API_KEY to your environment variables.');
+  const model = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
+  const languageInstruction = `REQUIRED LEARNER-FACING LANGUAGE: ${targetLanguage}. This setting is authoritative. Write ALL learner-visible content in ${targetLanguage}, including questions, answer choices, explanations, hints, feedback, instructions and button labels. Understand a teacher prompt written in another language, but create the activity in ${targetLanguage}. Do not leave learner-facing text in English unless English is selected. Preserve proper names, scientific symbols and equations where appropriate. Set the root HTML lang attribute to the appropriate language tag.`;
+  const gradeInstruction = targetGrade === 'Any grade'
+    ? 'TARGET LEARNER LEVEL: Any grade. Make the activity broadly accessible, explain subject-specific vocabulary and avoid assuming advanced prior knowledge.'
+    : `TARGET LEARNER LEVEL: ${targetGrade} in the South African school system. Adjust vocabulary, sentence length, abstraction, prerequisite knowledge, examples, number complexity, scaffolding and expected independence to this grade. Do not silently change the target grade.`;
+  const taskPrompt = action === 'fix'
+    ? `Fix the runtime error in this activity. Return the entire corrected HTML page, not a patch. Error: ${errorText}\n\nCurrent HTML:\n${currentHtml}`
+    : action === 'refine'
+      ? `Improve the current activity as requested. Return the entire updated HTML document and keep working features.\n\nEarlier refinement conversation:\n${history.map((item) => `${item.role === 'teacher' ? 'Teacher' : 'Morrow'}: ${item.text}`).join('\n')}\n\nLatest teacher request: ${prompt}\n\nCurrent HTML:\n${currentHtml}`
+      : `Create a new interactive learning activity from this teacher request. Follow the teacher's requested activity type rather than defaulting to multiple choice.\n\nTeacher request: ${prompt}`;
+  const timeoutSignal = AbortSignal.timeout(GROQ_TIMEOUT_MS);
+  const combinedSignal = AbortSignal.any([requestSignal, timeoutSignal]);
+  let response: Response;
+  try {
+    response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: 'system', content: `${SYSTEM_PROMPT}\n\n${languageInstruction}\n\n${gradeInstruction}` },
+          { role: 'user', content: `${languageInstruction}\n\n${gradeInstruction}\n\n${taskPrompt}` },
+        ],
+        stream: true,
+        max_completion_tokens: 12000,
+        reasoning_effort: 'low',
+      }),
+      signal: combinedSignal,
+    });
+  } catch (error) {
+    if (timeoutSignal.aborted) throw new ProviderHttpError('Groq', 504, 'Groq took too long to start generating.');
+    if (requestSignal.aborted) throw new Error('The generation request was cancelled because the page was closed or refreshed.');
+    throw new ProviderHttpError('Groq', 503, `Groq could not be reached: ${error instanceof Error ? error.message : 'network error'}`);
+  }
+
+  if (!response.ok || !response.body) {
+    const detail = await response.text().catch(() => '');
+    throw new ProviderHttpError('Groq', response.status, `Groq request failed (${response.status}). ${detail.slice(0, 700)}`);
+  }
+
+  const encoder = new TextEncoder();
+  const upstream = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        while (true) {
+          const { value, done } = await upstream.read();
+          if (done) {
+            buffer += decoder.decode();
+            for (const line of buffer.split('\n')) {
+              if (!line.startsWith('data:')) continue;
+              const raw = line.slice(5).trim();
+              if (!raw || raw === '[DONE]') continue;
+              const parsed = JSON.parse(raw) as { choices?: Array<{ delta?: { content?: string | null } }> };
+              const piece = parsed.choices?.[0]?.delta?.content || '';
+              if (piece) controller.enqueue(encoder.encode(piece));
+            }
+            controller.close();
+            return;
+          }
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            if (!line.startsWith('data:')) continue;
+            const raw = line.slice(5).trim();
+            if (!raw || raw === '[DONE]') continue;
+            const parsed = JSON.parse(raw) as { choices?: Array<{ delta?: { content?: string | null } }> };
+            const piece = parsed.choices?.[0]?.delta?.content || '';
+            if (piece) controller.enqueue(encoder.encode(piece));
+          }
+          return;
+        }
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    async cancel() {
+      if (!combinedSignal.aborted) {
         try { await upstream.cancel(); } catch { /* The upstream may already be closed. */ }
       }
     },
@@ -164,20 +270,38 @@ export async function POST(request: Request) {
 
   const fakeMode = process.env.MORROW_FAKE_MODE !== 'false';
   if (fakeMode) {
-    // Fake mode is intentionally saved sample output for interface testing. It never calls Gemini.
+    // Fake mode is intentionally saved sample output for interface testing. It never calls a live AI provider.
     // Avoid silently showing an English sample when the teacher selected another language.
-    if (targetLanguage !== 'English') return jsonError('Language-specific generation needs live Gemini. Set MORROW_FAKE_MODE=false and add GEMINI_API_KEY to generate in the selected language.', 409);
+    if (targetLanguage !== 'English') return jsonError('Language-specific generation needs live AI. Set MORROW_FAKE_MODE=false and add GEMINI_API_KEY or GROQ_API_KEY to generate in the selected language.', 409);
     return new Response(textStream(SAMPLE_ACTIVITY_HTML), {
       headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'private, no-store, max-age=0', 'X-Morrow-Mode': 'sample', 'Vary': 'Authorization' },
     });
   }
 
   try {
-    const stream = await streamGemini(prompt, currentHtml, action, runtimeError, history, targetLanguage, targetGrade, request.signal);
+    const hasGemini = Boolean(process.env.GEMINI_API_KEY);
+    const hasGroq = Boolean(process.env.GROQ_API_KEY);
+    if (!hasGemini && !hasGroq) return jsonError('No live AI provider is configured. Add GEMINI_API_KEY or GROQ_API_KEY in Vercel.', 503);
+
+    let stream: ReadableStream<Uint8Array>;
+    let provider: 'gemini' | 'groq' | 'groq-backup';
+    if (hasGemini) {
+      try {
+        stream = await streamGemini(prompt, currentHtml, action, runtimeError, history, targetLanguage, targetGrade, request.signal);
+        provider = 'gemini';
+      } catch (primaryError) {
+        if (!hasGroq || !canFallbackFromProvider(primaryError) || request.signal.aborted) throw primaryError;
+        stream = await streamGroq(prompt, currentHtml, action, runtimeError, history, targetLanguage, targetGrade, request.signal);
+        provider = 'groq-backup';
+      }
+    } else {
+      stream = await streamGroq(prompt, currentHtml, action, runtimeError, history, targetLanguage, targetGrade, request.signal);
+      provider = 'groq';
+    }
     return new Response(stream, {
-      headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'private, no-store, max-age=0', 'X-Morrow-Mode': 'gemini', 'Vary': 'Authorization' },
+      headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'private, no-store, max-age=0', 'X-Morrow-Mode': provider, 'Vary': 'Authorization' },
     });
   } catch (error) {
-    return jsonError(error instanceof Error ? error.message : 'Gemini could not create this activity.', 502);
+    return jsonError(error instanceof Error ? error.message : 'The AI provider could not create this activity.', 502);
   }
 }

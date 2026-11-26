@@ -13,11 +13,13 @@ test('fake mode sample is a complete single-file activity', () => {
   assert.match(SAMPLE_ACTIVITY_HTML, /<style>/i);
 });
 
-test('the project has one login page for both user roles', async () => {
+test('teachers can sign in or create a teacher account on the same screen', async () => {
   const page = await read('app/page.tsx');
   assert.match(page, /signInWithPassword/);
-  assert.match(page, /profile\.role === 'student'/);
-  assert.match(page, /router\.push\('\/student'\)/);
+  assert.match(page, /signUp\(/);
+  assert.match(page, /auth\.signUp/);
+  assert.match(page, /Create teacher account/);
+  assert.doesNotMatch(page, /\/student/);
 });
 
 test('database schema enables RLS and separates teacher permissions', async () => {
@@ -28,21 +30,16 @@ test('database schema enables RLS and separates teacher permissions', async () =
   assert.match(sql, /Teachers can read their own versions/i);
 });
 
-test('only one teacher test account and one student test account are configured', async () => {
+test('new Auth users automatically receive teacher-only profiles', async () => {
   const sql = await read('supabase/schema.sql');
-  assert.match(sql, /teacher@morrow\.app/i);
-  assert.match(sql, /student@morrow\.app/i);
-  assert.match(sql, /'Grade 7'/);
-});
-
-
-test('student grade access is strict and allows only Any grade as a general activity', async () => {
-  const { canStudentAccessGrade } = await import('../lib/grade-access.ts');
-  assert.equal(canStudentAccessGrade('Grade 7', 'Grade 7'), true);
-  assert.equal(canStudentAccessGrade('Grade 7', 'Grade 6'), false);
-  assert.equal(canStudentAccessGrade(null, 'Grade 7'), false);
-  assert.equal(canStudentAccessGrade(null, 'Any grade'), true);
-  assert.equal(canStudentAccessGrade('Grade 7', null), false);
+  const migration = await read('supabase/migrations/20261126_teacher_accounts_only.sql');
+  assert.match(sql, /role text not null default 'teacher' check \(role = 'teacher'\)/);
+  assert.match(sql, /after insert on auth\.users/i);
+  assert.match(sql, /handle_new_teacher_profile/);
+  assert.match(migration, /delete from auth\.users/i);
+  assert.match(migration, /old_profile\.role = 'student'/i);
+  assert.match(migration, /role = 'teacher'/);
+  assert.match(migration, /drop policy if exists \"Students read published activities for their grade\"/i);
 });
 
 test('teacher can create a saved activity without calling the AI endpoint', async () => {

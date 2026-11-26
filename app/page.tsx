@@ -1,7 +1,6 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
-import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import PreviewFrame from '@/components/preview-frame';
 import { getSupabaseBrowserClient } from '@/lib/supabase-browser';
@@ -11,7 +10,7 @@ import { buildManualActivityHtml, createManualQuestion, type ManualQuestionInput
 import { ACTIVITY_LANGUAGES, DEFAULT_ACTIVITY_LANGUAGE, normalizeActivityLanguage, type ActivityLanguage } from '@/lib/activity-languages';
 
 type AppScreen = 'dashboard' | 'builder';
-type Config = { supabaseConfigured: boolean; fakeMode: boolean; geminiConfigured: boolean; model: string };
+type Config = { supabaseConfigured: boolean; fakeMode: boolean; geminiConfigured: boolean; groqConfigured: boolean; model: string; groqModel: string };
 
 async function readStream(response: Response, onText: (value: string) => void): Promise<string> {
   if (!response.body) throw new Error('The generation service returned an empty response.');
@@ -28,7 +27,7 @@ async function readStream(response: Response, onText: (value: string) => void): 
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (/abort|timeout|timed out|terminated|network/i.test(message)) {
-      throw new Error('Gemini stopped before the activity was complete. Please try again with a shorter or simpler request. Your existing saved activity has not been changed.');
+      throw new Error('AI generation stopped before the activity was complete. Please try again with a shorter or simpler request. Your existing saved activity has not been changed.');
     }
     throw error;
   }
@@ -38,13 +37,15 @@ async function readStream(response: Response, onText: (value: string) => void): 
 }
 
 export default function MorrowHome() {
-  const router = useRouter();
-  const [config, setConfig] = useState<Config>({ supabaseConfigured: false, fakeMode: true, geminiConfigured: false, model: 'gemini-3.8-flash' });
+  const [config, setConfig] = useState<Config>({ supabaseConfigured: false, fakeMode: true, geminiConfigured: false, groqConfigured: false, model: 'gemini-3.8-flash', groqModel: 'openai/gpt-oss-120b' });
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [displayName, setDisplayName] = useState('');
+  const [authMode, setAuthMode] = useState<'signin' | 'signup'>('signin');
   const [notice, setNotice] = useState('');
+  const [noticeSuccess, setNoticeSuccess] = useState(false);
   const [busy, setBusy] = useState(false);
   const [activities, setActivities] = useState<Activity[]>([]);
   const [screen, setScreen] = useState<AppScreen>('dashboard');
@@ -101,7 +102,6 @@ export default function MorrowHome() {
       const sessionData = await sessionResponse.json();
       if (!sessionResponse.ok || !sessionData.profile) { await supabase.auth.signOut(); return; }
       if (!active) return;
-      if (sessionData.profile.role === 'student') { router.replace('/student'); return; }
       setProfile(sessionData.profile);
       setEmail(sessionData.user.email || '');
       await loadActivities(token);
@@ -109,12 +109,13 @@ export default function MorrowHome() {
     start().catch((error: unknown) => { if (active) setNotice(error instanceof Error ? error.message : 'Could not open Morrow.'); })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [loadActivities, router]);
+  }, [loadActivities]);
 
   async function signIn(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setBusy(true);
     setNotice('');
+    setNoticeSuccess(false);
     const supabase = getSupabaseBrowserClient();
     if (!supabase) {
       setNotice('Supabase has not been connected yet. Follow the Supabase setup guide in the project folder, then add the two public Supabase values to .env.local.');
@@ -128,14 +129,55 @@ export default function MorrowHome() {
       const result = await response.json();
       if (!response.ok || !result.profile) {
         await supabase.auth.signOut();
-        throw new Error('This account has not been assigned a Morrow role yet. Complete the profile setup SQL in the Supabase guide.');
+        throw new Error('This account does not have a teacher profile yet. Apply the teacher-account migration in the Supabase setup guide.');
       }
-      if (result.profile.role === 'student') { router.push('/student'); return; }
       setProfile(result.profile);
       setEmail(result.user.email || email);
       await loadActivities(data.session.access_token);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'Could not sign in.');
+    } finally { setBusy(false); }
+  }
+
+  async function signUp(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setNotice('');
+    setNoticeSuccess(false);
+    const supabase = getSupabaseBrowserClient();
+    if (!supabase) {
+      setNotice('Supabase has not been connected yet. Add the two public Supabase values from your project settings.');
+      setBusy(false);
+      return;
+    }
+    try {
+      const { data, error } = await supabase.auth.signUp({
+        email: email.trim(),
+        password,
+        options: {
+          data: { display_name: displayName.trim() },
+          emailRedirectTo: window.location.origin,
+        },
+      });
+      if (error) throw error;
+      if (data.session) {
+        const response = await fetch('/api/auth/session', { headers: { Authorization: `Bearer ${data.session.access_token}` } });
+        const result = await response.json();
+        if (!response.ok || !result.profile) {
+          await supabase.auth.signOut();
+          throw new Error('Your account was created, but its teacher profile was not found. Apply the teacher-account migration in Supabase.');
+        }
+        setProfile(result.profile);
+        setEmail(result.user.email || email);
+        await loadActivities(data.session.access_token);
+        return;
+      }
+      setNotice('Your teacher account has been created. Check your email for the confirmation link, then return here to sign in.');
+      setNoticeSuccess(true);
+      setAuthMode('signin');
+      setPassword('');
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Could not create your account.');
     } finally { setBusy(false); }
   }
 
@@ -145,6 +187,8 @@ export default function MorrowHome() {
     setActivities([]);
     setPassword('');
     setNotice('');
+    setNoticeSuccess(false);
+    setAuthMode('signin');
     setScreen('dashboard');
     setActiveActivity(null);
   }
@@ -420,8 +464,8 @@ export default function MorrowHome() {
     if (handlingError.current) return;
     handlingError.current = true;
     const currentAttempts = fixAttempts;
-    if (config.fakeMode || !config.geminiConfigured) {
-      setNotice(`The preview reported an error: ${message}. Automatic fixing needs Gemini mode. The previous saved version has been kept.`);
+    if (config.fakeMode || (!config.geminiConfigured && !config.groqConfigured)) {
+      setNotice(`The preview reported an error: ${message}. Automatic fixing needs live AI mode. The previous saved version has been kept.`);
       setHtml(lastWorkingHtml.current);
       handlingError.current = false;
       return;
@@ -467,7 +511,7 @@ export default function MorrowHome() {
       // Let the replacement iframe mount before it is allowed to report another error.
       window.setTimeout(() => { handlingError.current = false; }, 600);
     }
-  }, [config.fakeMode, config.geminiConfigured, fixAttempts, getToken, html, language, grade]);
+  }, [config.fakeMode, config.geminiConfigured, config.groqConfigured, fixAttempts, getToken, html, language, grade]);
 
   if (loading) return <main className="center-screen"><div className="loading-card">Opening Morrow…</div></main>;
 
@@ -483,14 +527,18 @@ export default function MorrowHome() {
           <div className="login-card">
             <p className="eyebrow">MORROW LEARNING</p>
             <h1>Welcome to Morrow.</h1>
-            <p className="muted">Sign in to your workspace. Teachers and students use this same page.</p>
+            <p className="muted">Sign in to your teaching workspace, or create a teacher account to get started.</p>
             {!config.supabaseConfigured && <p className="notice error-notice">Supabase is not connected yet. Add the two Supabase values from your project settings after following the setup guide.</p>}
-            <form className="form-stack" onSubmit={signIn}>
-              <label>Email address<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} required placeholder="you@example.com" autoComplete="off" /></label>
-              <label>Password<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
-              {notice && <p className="notice error-notice">{notice}</p>}
-              <button className="button primary-button full-button" disabled={busy || !config.supabaseConfigured}>{busy ? 'Signing in…' : 'Sign in'} <span aria-hidden="true">↗</span></button>
+            <form className="form-stack" onSubmit={authMode === 'signin' ? signIn : signUp}>
+              {authMode === 'signup' && <label>Your name<input type="text" value={displayName} onChange={(event) => setDisplayName(event.target.value)} required maxLength={80} placeholder="Your name" autoComplete="name" /></label>}
+              <label>Email address<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} required placeholder="you@example.com" autoComplete="email" /></label>
+              <label>Password<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} required minLength={8} autoComplete={authMode === 'signin' ? 'current-password' : 'new-password'} /></label>
+              {notice && <p className={noticeSuccess ? 'notice' : 'notice error-notice'} role="status">{notice}</p>}
+              <button className="button primary-button full-button" disabled={busy || !config.supabaseConfigured}>{busy ? (authMode === 'signin' ? 'Signing in…' : 'Creating account…') : (authMode === 'signin' ? 'Sign in' : 'Create teacher account')} <span aria-hidden="true">↗</span></button>
             </form>
+            <button type="button" className="link-button auth-mode-toggle" onClick={() => { setAuthMode(authMode === 'signin' ? 'signup' : 'signin'); setNotice(''); setNoticeSuccess(false); }}>
+              {authMode === 'signin' ? 'New to Morrow? Create a teacher account' : 'Already have an account? Sign in'}
+            </button>
 
           </div>
         </section>
@@ -516,12 +564,12 @@ export default function MorrowHome() {
               <div><p className="eyebrow">TEACHER WORKSPACE</p><h1>Your activities.</h1><p className="muted">Describe what you want learners to do. Morrow builds a complete interactive activity you can preview, refine and share.</p></div>
               <div className="form-actions"><button className="button primary-button" onClick={startNewActivity}>＋ Create activity</button></div>
             </section>
-            <div className="mode-row"><span className={config.fakeMode ? 'mode-dot sample-mode' : 'mode-dot live-mode'} />{config.fakeMode ? 'Sample mode is on. You can also build activities manually without AI.' : config.geminiConfigured ? `Gemini is connected (${config.model}).` : 'AI generation is unavailable. You can still create activities without AI.'}</div>
+            <div className="mode-row"><span className={config.fakeMode ? 'mode-dot sample-mode' : 'mode-dot live-mode'} />{config.fakeMode ? 'Sample mode is on. You can also build activities manually without AI.' : config.geminiConfigured && config.groqConfigured ? `Gemini is connected (${config.model}) with Groq as an automatic backup (${config.groqModel}).` : config.geminiConfigured ? `Gemini is connected (${config.model}).` : config.groqConfigured ? `Groq AI is connected (${config.groqModel}).` : 'AI generation is unavailable. You can still create activities without AI.'}</div>
             {notice && <p className="notice">{notice}</p>}
             <section className="section-block">
               <div className="section-heading"><div><h2>My saved activities</h2><p>{activities.length} {activities.length === 1 ? 'activity' : 'activities'} saved to your account</p></div></div>
               {activities.length === 0 ? (
-                <div className="empty-state"><h3>Your first activity starts here</h3><p>Describe a lesson, game or simulation for Gemini, or use the manual builder when AI is unavailable.</p><button className="button primary-button" onClick={startNewActivity}>Create an activity</button></div>
+                <div className="empty-state"><h3>Your first activity starts here</h3><p>Describe a lesson, game or simulation for Morrow, or use the manual builder when AI is unavailable.</p><button className="button primary-button" onClick={startNewActivity}>Create an activity</button></div>
               ) : (
                 <div className="activity-grid">
                   {activities.map((activity) => <article className="activity-card" key={activity.id}>
@@ -547,7 +595,7 @@ export default function MorrowHome() {
                   {activeActivity && refinementHistory.length > 0 && <div className="refinement-chat" aria-live="polite">{refinementHistory.map((message, index) => <div className={`refinement-message ${message.role}`} key={`${message.role}-${index}`}><b>{message.role === 'teacher' ? 'You' : 'Morrow'}</b><p>{message.text}</p></div>)}</div>}
                   <label>Activity title<input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="e.g. Explore the solar system" maxLength={120} /></label>
                   <div className="form-row"><label>Subject<input value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="e.g. Natural Sciences" /></label><label>Grade<select value={grade} onChange={(event) => setGrade(event.target.value)}>{Array.from({ length: 12 }, (_, index) => <option key={index}>Grade {index + 1}</option>)}<option>Any grade</option></select></label></div>
-                  <label>Activity language<select value={language} onChange={(event) => setLanguage(event.target.value as ActivityLanguage)}>{['South African official languages', 'Additional languages'].map((group) => <optgroup key={group} label={group}>{ACTIVITY_LANGUAGES.filter((item) => item.group === group).map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</optgroup>)}</select><span className="form-help">Gemini will write every learner-facing part, including all questions, answer choices, instructions and feedback, in this language. For an existing activity, ask Morrow to translate it after changing this setting. Manual activities must be typed in the language you want learners to use.</span></label>
+                  <label>Activity language<select value={language} onChange={(event) => setLanguage(event.target.value as ActivityLanguage)}>{['South African official languages', 'Additional languages'].map((group) => <optgroup key={group} label={group}>{ACTIVITY_LANGUAGES.filter((item) => item.group === group).map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</optgroup>)}</select><span className="form-help">The connected AI provider will write every learner-facing part, including all questions, answer choices, instructions and feedback, in this language. For an existing activity, ask Morrow to translate it after changing this setting. Manual activities must be typed in the language you want learners to use.</span></label>
                   <label>Short description<textarea value={description} onChange={(event) => setDescription(event.target.value)} rows={2} placeholder="What should learners take away from it?" /></label>
                   <form className="prompt-box form-stack" onSubmit={generateActivity}>
                     <label>{activeActivity ? 'Refine with a message' : 'What should Morrow make?'}<textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={5} placeholder={activeActivity ? 'e.g. Make the simulation easier and add a challenge at the end.' : 'e.g. Make a simple interactive water cycle simulation for Grade 7. Learners should be able to change the temperature and see what happens to evaporation.'} /></label>
@@ -555,11 +603,11 @@ export default function MorrowHome() {
                     <button className="button primary-button full-button" disabled={busy || autoFixing || !prompt.trim()}>{busy ? 'Building your activity…' : activeActivity ? 'Refine activity' : 'Generate activity'} <span aria-hidden="true">↗</span></button>
                   </form>
                   <div className="manual-fallback-intro">
-                    <div><strong>AI unavailable?</strong><p>You can still make a useful activity with the manual builder. It does not need Gemini to create the page. Saving and sharing still need Supabase to be connected.</p></div>
+                    <div><strong>AI unavailable?</strong><p>You can still make a useful activity with the manual builder. It does not need an AI provider to create the page. Saving and sharing still need Supabase to be connected.</p></div>
                     <button type="button" className="button light-button" onClick={() => setShowManualBuilder((value) => !value)}>{showManualBuilder ? 'Close manual builder' : 'Build without AI'}</button>
                   </div>
                   {showManualBuilder && <form className="manual-builder form-stack" onSubmit={createWithoutAi}>
-                    <div><p className="eyebrow">MANUAL ACTIVITY BUILDER</p><h3>Create without AI</h3><p className="form-help">Build one complete activity with as many questions as you need. Each question can use a different interaction. Enter manual learner-facing text in your chosen language; language generation is handled by Gemini above.</p></div>
+                    <div><p className="eyebrow">MANUAL ACTIVITY BUILDER</p><h3>Create without AI</h3><p className="form-help">Build one complete activity with as many questions as you need. Each question can use a different interaction. Enter manual learner-facing text in your chosen language; language generation is handled by the connected AI provider above.</p></div>
                     <label>Lesson content or notes<textarea value={manualLesson} onChange={(event) => setManualLesson(event.target.value)} rows={4} placeholder="Explain the topic or paste a short set of lesson notes." /></label>
                     <label>Instructions for learners<textarea value={manualInstructions} onChange={(event) => setManualInstructions(event.target.value)} rows={2} placeholder="e.g. Read the notes, then complete every question." /></label>
                     <div className="manual-question-list">
